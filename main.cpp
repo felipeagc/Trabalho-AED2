@@ -174,48 +174,50 @@ void test_collisions(Table &table) {
     }
   }
 
-  printf("Collisions: %u\n", collisions);
+  printf("=> Colisões: %u\n", collisions);
 
   fclose(file);
+}
+
+const char *method_name(Method method) {
+  switch (method) {
+  case Method::NONE: return "nenhum";
+  case Method::CHAIN_HEAD: return "encadeamento com cabeça";
+  case Method::CHAIN_NO_HEAD: return "encadeamento sem cabeça";
+  case Method::COLLISION_ZONE: return "zona de colisão";
+  }
+  return "";
+}
+
+const char *hash_fn_name(HashFn fn) {
+  if (fn == hash_mult) return "multiplicação";
+  if (fn == hash_mult_quad) return "multiplicação (quadrado)";
+  if (fn == hash_divisao) return "divisão";
+  if (fn == hash_divisao_primo) return "divisão (primo)";
+  if (fn == hash_dobra) return "dobra";
+  return "";
 }
 
 int main() {
   uint32_t table_size = 10000;
 
-  {
-    Table table("./table.bin", hash_mult, table_size, Method::NONE);
-    test_collisions(table);
+  Method methods[]  = {Method::NONE};
+  HashFn hash_fns[] = {
+      hash_mult, hash_mult_quad, hash_divisao, hash_divisao_primo, hash_dobra};
 
-    // Esse ID é valido com esse hash e tratamento de colisão
-    uint32_t id = 58172200;
+  for (const Method &method : methods) {
+    for (const HashFn &hash_fn : hash_fns) {
+      Table table("./table.bin", hash_fn, table_size, method);
 
-    bool found = table.search(id, nullptr);
-    assert(found);
+      printf(
+          "Tratamento de colisões: %s\nFunção: %s\n",
+          method_name(method),
+          hash_fn_name(hash_fn));
 
-    table.remove(id);
+      test_collisions(table);
 
-    found = table.search(id, nullptr);
-    assert(!found);
-  }
-
-  {
-    Table table("./table.bin", hash_mult_quad, table_size, Method::NONE);
-    test_collisions(table);
-  }
-
-  {
-    Table table("./table.bin", hash_divisao, table_size, Method::NONE);
-    test_collisions(table);
-  }
-
-  {
-    Table table("./table.bin", hash_divisao_primo, table_size, Method::NONE);
-    test_collisions(table);
-  }
-
-  {
-    Table table("./table.bin", hash_dobra, table_size, Method::NONE);
-    test_collisions(table);
+      printf("\n");
+    }
   }
 
   return 0;
