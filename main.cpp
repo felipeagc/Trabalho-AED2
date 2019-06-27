@@ -40,77 +40,99 @@ struct Table {
 
   Table(const char *path, HashFn hash_fn, size_t entry_cap, Method method) {
     this->method = method;
-    this->file = fopen(path, "w+b");
+    this->file   = fopen(path, "w+b");
     assert(this->file);
 
-    this->hash_fn = hash_fn;
+    this->hash_fn   = hash_fn;
     this->entry_cap = entry_cap;
 
     fseek(this->file, 0, SEEK_SET);
     if (ftell(this->file) == 0) {
-      // File is empty
-      FileHeader header;
-      header.entry_cap = this->entry_cap;
+      FileHeader header = {};
+      header.entry_cap  = this->entry_cap;
 
-      fwrite(&header, sizeof(header), 1, this->file);
-
-      Slot dummy;
-      memset(&dummy, 0, sizeof(dummy));
-
-      for (uint32_t i = 0; i < this->entry_cap; i++) {
-        fseek(this->file, sizeof(FileHeader) + (sizeof(dummy) * i), SEEK_SET);
-        fwrite(&dummy, sizeof(dummy), 1, this->file);
-      }
+      write_at(0, sizeof(header), &header);
     }
   }
 
   ~Table() { fclose(this->file); }
 
+  inline bool read_at(size_t pos, size_t size, void *ptr) {
+    fseek(this->file, pos, SEEK_SET);
+    size_t read = fread(ptr, size, 1, this->file);
+    return read == 1;
+  }
+
+  inline bool write_at(size_t pos, size_t size, void *ptr) {
+    fseek(this->file, pos, SEEK_SET);
+    size_t written = fwrite(ptr, size, 1, this->file);
+    return written == 1;
+  }
+
   bool insert(const Entry &entry) {
-    uint32_t hash = this->hash_fn(entry.id);
-    hash = hash % this->entry_cap;
+    uint32_t hash = this->hash_fn(entry.id) % this->entry_cap;
 
-    Slot slot;
+    switch (this->method) {
+    case Method::NONE: {
+      Slot slot = {};
 
-    fseek(this->file, sizeof(FileHeader) + (sizeof(slot) * hash), SEEK_SET);
-    size_t read = fread(&slot, sizeof(slot), 1, this->file);
-    assert(read == 1);
+      size_t pos = sizeof(FileHeader) + (sizeof(slot) * hash);
+      if (read_at(pos, sizeof(slot), &slot)) {
+        if (slot.filled) return false;
+      }
 
-    if (slot.filled) {
-      // Collision
-      return false;
+      slot.entry  = entry;
+      slot.filled = true;
+
+      write_at(pos, sizeof(slot), &slot);
+
+      return true;
     }
-
-    slot.entry = entry;
-    slot.filled = true;
-
-    fseek(this->file, sizeof(FileHeader) + (sizeof(slot) * hash), SEEK_SET);
-    fwrite(&slot, sizeof(slot), 1, this->file);
-
-    return true;
+    default: return false;
+    }
   }
 
   bool search(const uint32_t id, Entry *entry) {
-    uint32_t hash = this->hash_fn(id);
-    hash = hash % this->entry_cap;
+    uint32_t hash = this->hash_fn(id) % this->entry_cap;
 
-    Slot slot;
+    switch (this->method) {
+    case Method::NONE: {
+      Slot slot = {};
 
-    fseek(this->file, sizeof(FileHeader) + (sizeof(slot) * hash), SEEK_SET);
-    size_t read = fread(&slot, sizeof(slot), 1, this->file);
-    assert(read == 1);
+      size_t pos = sizeof(FileHeader) + (sizeof(slot) * hash);
+      if (read_at(pos, sizeof(slot), &slot)) {
+        if (!slot.filled) return false;
+        if (slot.entry.id != id) return false;
+        if (entry != nullptr) *entry = slot.entry;
 
-    if (!slot.filled) {
+        return true;
+      }
+
       return false;
     }
+    default: return false;
+    }
+  }
 
-    if (slot.entry.id != id) {
-      return false;
+  void remove(const uint32_t id) {
+    if (!search(id, NULL)) {
+      return;
     }
 
-    *entry = slot.entry;
+    uint32_t hash = this->hash_fn(id) % this->entry_cap;
 
-    return true;
+    switch (this->method) {
+    case Method::NONE: {
+      Slot slot   = {};
+      slot.filled = false;
+
+      size_t pos = sizeof(FileHeader) + (sizeof(slot) * hash);
+      write_at(pos, sizeof(slot), &slot);
+
+      break;
+    }
+    default: return;
+    }
   }
 };
 
@@ -130,13 +152,13 @@ void test_collisions(Table &table) {
 
     char *pt;
 
-    pt = strtok(buf, ",");
+    pt         = strtok(buf, ",");
     entry.line = atoi(pt); // numero da linha
-    pt = strtok(NULL, ",");
+    pt         = strtok(NULL, ",");
     strncpy(entry.address, pt, 50); // endereco
-    pt = strtok(NULL, ",");
+    pt       = strtok(NULL, ",");
     entry.id = atoi(pt); // id
-    pt = strtok(NULL, ",");
+    pt       = strtok(NULL, ",");
     strncpy(entry.birthdate, pt, 10); // data de nascimento
     pt = strtok(NULL, ",");
     strncpy(entry.name, pt, 40); // nome
@@ -158,33 +180,41 @@ void test_collisions(Table &table) {
 }
 
 int main() {
+  uint32_t table_size = 10000;
+
   {
-    Table table("./table.bin", hash_mult, 10000, Method::NONE);
+    Table table("./table.bin", hash_mult, table_size, Method::NONE);
     test_collisions(table);
 
-    Entry entry;
-    if (table.search(58172200, &entry)) {
-      printf("Found: %s\n", entry.name);
-    }
+    // Esse ID é valido com esse hash e tratamento de colisão
+    uint32_t id = 58172200;
+
+    bool found = table.search(id, nullptr);
+    assert(found);
+
+    table.remove(id);
+
+    found = table.search(id, nullptr);
+    assert(!found);
   }
 
   {
-    Table table("./table.bin", hash_mult_quad, 10000, Method::NONE);
-    test_collisions(table);
-  }
-
-  {
-    Table table("./table.bin", hash_divisao, 10000, Method::NONE);
-    test_collisions(table);
-  }
-
-  {
-    Table table("./table.bin", hash_divisao_primo, 10000, Method::NONE);
+    Table table("./table.bin", hash_mult_quad, table_size, Method::NONE);
     test_collisions(table);
   }
 
   {
-    Table table("./table.bin", hash_dobra, 10000, Method::NONE);
+    Table table("./table.bin", hash_divisao, table_size, Method::NONE);
+    test_collisions(table);
+  }
+
+  {
+    Table table("./table.bin", hash_divisao_primo, table_size, Method::NONE);
+    test_collisions(table);
+  }
+
+  {
+    Table table("./table.bin", hash_dobra, table_size, Method::NONE);
     test_collisions(table);
   }
 
