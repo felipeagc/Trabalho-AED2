@@ -26,8 +26,13 @@ struct Entry {
 };
 
 struct Slot {
-  bool filled;
+  bool filled = false;
   Entry entry;
+  size_t next = 0;
+};
+
+struct SlotNoHead {
+  size_t next = 0;
 };
 
 struct FileHeader {
@@ -51,8 +56,14 @@ struct Table {
 
     switch (this->method) {
     case Method::NONE:
-    case Method::COLLISION_ZONE: {
+    case Method::COLLISION_ZONE:
+    case Method::CHAIN_HEAD: {
       this->zone_offset = sizeof(FileHeader) + (sizeof(Slot) * this->entry_cap);
+      break;
+    }
+    case Method::CHAIN_NO_HEAD: {
+      this->zone_offset =
+          sizeof(FileHeader) + (sizeof(SlotNoHead) * this->entry_cap);
       break;
     }
     default: break;
@@ -64,6 +75,29 @@ struct Table {
 
       bool wrote = write_at(0, sizeof(header), &header);
       assert(wrote);
+
+      switch (this->method) {
+      case Method::NONE:
+      case Method::COLLISION_ZONE:
+      case Method::CHAIN_HEAD: {
+        for (uint32_t i = 0; i < this->entry_cap; i++) {
+          Slot slot = {};
+          wrote     = write_at(
+              sizeof(FileHeader) + (i * sizeof(slot)), sizeof(slot), &slot);
+          assert(wrote);
+        }
+        break;
+      }
+      case Method::CHAIN_NO_HEAD: {
+        for (uint32_t i = 0; i < this->entry_cap; i++) {
+          SlotNoHead slot = {};
+          wrote           = write_at(
+              sizeof(FileHeader) + (i * sizeof(slot)), sizeof(slot), &slot);
+          assert(wrote);
+        }
+        break;
+      }
+      }
     }
   }
 
@@ -138,6 +172,61 @@ struct Table {
 
       return true;
     }
+    case Method::CHAIN_HEAD: {
+      Slot slot = {};
+
+      size_t pos = sizeof(FileHeader) + (sizeof(slot) * hash);
+      if (read_at(pos, sizeof(slot), &slot) && slot.filled) {
+        size_t new_pos = std::max(file_size(), this->zone_offset);
+
+        size_t old_next = slot.next;
+
+        slot.next  = new_pos;
+        bool wrote = write_at(pos, sizeof(slot), &slot);
+        assert(wrote);
+
+        slot.entry  = entry;
+        slot.filled = true;
+        slot.next   = old_next;
+        wrote       = write_at(new_pos, sizeof(slot), &slot);
+        assert(wrote);
+
+        if (collided) *collided = true;
+      } else {
+        if (collided) *collided = false;
+
+        slot.entry  = entry;
+        slot.filled = true;
+        slot.next   = 0;
+        bool wrote  = write_at(pos, sizeof(slot), &slot);
+        assert(wrote);
+      }
+
+      return true;
+    }
+    case Method::CHAIN_NO_HEAD: {
+      SlotNoHead main_slot = {};
+      size_t pos           = sizeof(FileHeader) + sizeof(main_slot) * hash;
+
+      read_at(pos, sizeof(main_slot), &main_slot);
+      size_t old = main_slot.next;
+
+      if (collided) *collided = (old != 0);
+
+      main_slot.next = std::max(file_size(), this->zone_offset);
+      write_at(pos, sizeof(main_slot), &main_slot);
+
+      Slot slot = {};
+
+      slot.entry  = entry;
+      slot.filled = true;
+      slot.next   = old;
+      bool wrote  = write_at(main_slot.next, sizeof(slot), &slot);
+      assert(wrote);
+
+      return true;
+      break;
+    }
     default: return false;
     }
   }
@@ -189,6 +278,54 @@ struct Table {
 
       return false;
     }
+    case Method::CHAIN_HEAD: {
+      Slot slot = {};
+
+      size_t pos = sizeof(FileHeader) + (sizeof(slot) * hash);
+      read_at(pos, sizeof(slot), &slot);
+
+      if (slot.filled) {
+        if (slot.entry.id == id) {
+          if (entry != nullptr) *entry = slot.entry;
+          if (file_pos != nullptr) *file_pos = pos;
+          return true;
+        }
+
+        while (slot.next != 0) {
+          pos = slot.next;
+          if (read_at(pos, sizeof(slot), &slot)) {
+            if (slot.filled && slot.entry.id == id) {
+              if (entry != nullptr) *entry = slot.entry;
+              if (file_pos != nullptr) *file_pos = pos;
+              return true;
+            }
+          }
+        }
+      }
+
+      return false;
+    }
+    case Method::CHAIN_NO_HEAD: {
+      SlotNoHead main_slot = {};
+      size_t pos           = sizeof(FileHeader) + (sizeof(main_slot) * hash);
+      read_at(pos, sizeof(main_slot), &main_slot);
+
+      size_t slot_pos = main_slot.next;
+
+      Slot slot = {};
+      while (slot_pos != 0) {
+        read_at(slot_pos, sizeof(slot), &slot);
+        slot_pos = slot.next;
+
+        if (slot.entry.id == id) {
+          if (entry != nullptr) *entry = slot.entry;
+          if (file_pos != nullptr) *file_pos = slot_pos;
+          return true;
+        }
+      }
+
+      return false;
+    }
     default: return false;
     }
   }
@@ -202,11 +339,80 @@ struct Table {
     switch (this->method) {
     case Method::NONE:
     case Method::COLLISION_ZONE: {
-      Slot slot   = {};
-      slot.filled = false;
+      Slot slot = {};
 
       bool wrote = write_at(pos, sizeof(slot), &slot);
       assert(wrote);
+
+      return true;
+    }
+    case Method::CHAIN_HEAD: {
+      uint32_t hash = this->hash_fn(id) % this->entry_cap;
+
+      Slot slot       = {};
+      size_t main_pos = sizeof(FileHeader) + (sizeof(slot) * hash);
+      read_at(pos, sizeof(slot), &slot);
+
+      if (main_pos == pos) {
+        // Cabeça
+        if (slot.next != 0) {
+          read_at(slot.next, sizeof(slot), &slot);
+          write_at(main_pos, sizeof(slot), &slot);
+          return true;
+        } else {
+          slot.filled = false;
+          write_at(main_pos, sizeof(slot), &slot);
+          return true;
+        }
+      } else {
+        // Filho
+        size_t parent_pos = main_pos;
+        Slot parent;
+        read_at(parent_pos, sizeof(parent), &parent);
+
+        while (parent.next != 0) {
+          if (parent.next == pos) {
+            break;
+          }
+
+          parent_pos = parent.next;
+          read_at(parent_pos, sizeof(parent), &parent);
+        }
+
+        parent.next = slot.next;
+        write_at(parent_pos, sizeof(parent), &parent);
+      }
+
+      return true;
+    }
+    case Method::CHAIN_NO_HEAD: {
+      uint32_t hash = this->hash_fn(id) % this->entry_cap;
+
+      SlotNoHead main_slot;
+      size_t main_pos = sizeof(FileHeader) + (sizeof(main_slot) * hash);
+      read_at(main_pos, sizeof(main_slot), &main_slot);
+
+      Slot slot = {};
+      read_at(pos, sizeof(slot), &slot);
+
+      if (main_slot.next == pos) {
+        // First
+        main_slot.next = slot.next;
+        write_at(main_pos, sizeof(main_slot), &main_slot);
+      } else if (slot.next == 0) {
+        // Last/middle
+        Slot parent_slot  = {};
+        size_t parent_pos = main_slot.next;
+        read_at(parent_pos, sizeof(parent_slot), &parent_slot);
+
+        while (parent_slot.next != pos && parent_slot.next != 0) {
+          parent_pos = parent_slot.next;
+          read_at(parent_pos, sizeof(parent_slot), &parent_slot);
+        }
+
+        parent_slot.next = slot.next;
+        write_at(parent_pos, sizeof(parent_slot), &parent_slot);
+      }
 
       return true;
     }
@@ -270,6 +476,7 @@ void test(Table &table) {
 
   // Testa se a remoção funciona (muito lento com zona de colisão)
   // for (const Entry &entry : entries) {
+  //   size_t pos;
   //   bool removed = table.remove(entry.id);
   //   assert(removed);
 
@@ -302,7 +509,10 @@ const char *hash_fn_name(HashFn fn) {
 int main() {
   uint32_t table_size = 10000;
 
-  Method methods[]  = {Method::NONE, Method::COLLISION_ZONE};
+  Method methods[]  = {Method::NONE,
+                      Method::COLLISION_ZONE,
+                      Method::CHAIN_HEAD,
+                      Method::CHAIN_NO_HEAD};
   HashFn hash_fns[] = {
       hash_mult, hash_mult_quad, hash_divisao, hash_divisao_primo, hash_dobra};
 
